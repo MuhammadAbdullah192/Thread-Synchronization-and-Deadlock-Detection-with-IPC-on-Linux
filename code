@@ -1,0 +1,298 @@
+#include <iostream> 
+#include <pthread.h> 
+#include <unistd.h> 
+#include <sys/ipc.h> 
+#include <sys/msg.h> 
+#include <sys/shm.h> 
+#include <cstring> 
+#include <chrono> 
+#include <vector> 
+#include <algorithm> 
+#include <numeric> 
+#include <iomanip> 
+#include <semaphore.h> 
+using namespace std; 
+vector<long long> threadTimes(5); 
+sem_t semA, semB; 
+bool deadlock_prevented = true; 
+struct ThreadArg { int idx; }; 
+struct my_msgbuf { 
+long mtype; 
+char mtext[64]; 
+}; 
+void* dept1(void* a) { 
+int idx = ((ThreadArg*)a)->idx; 
+auto t0 = chrono::steady_clock::now(); 
+key_t key = ftok("/tmp", 65); 
+int msqid = msgget(key, 0666 | IPC_CREAT); 
+my_msgbuf sbuf{1, ""}; 
+strcpy(sbuf.mtext, "FileRequestFromDept1"); 
+msgsnd(msqid, &sbuf, strlen(sbuf.mtext)+1, 0); 
+my_msgbuf rbuf; 
+msgrcv(msqid, &rbuf, sizeof(rbuf.mtext), 2, 0); 
+cout << "[Dept1] received reply: " << rbuf.mtext << "\n"; 
+msgctl(msqid, IPC_RMID, nullptr); 
+for (volatile int w = 0; w < 10000; ++w) 
+for (volatile int k = 0; k < 10000; ++k) { int dummy = w + k; } 
+    auto t1 = chrono::steady_clock::now(); 
+    threadTimes[idx] = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count(); 
+    return nullptr; 
+} 
+ 
+void* dept2(void* a) { 
+    int idx = ((ThreadArg*)a)->idx; 
+    auto t0 = chrono::steady_clock::now(); 
+ 
+    key_t key = ftok("/tmp", 65); 
+    int msqid = msgget(key, 0666 | IPC_CREAT); 
+    my_msgbuf rbuf; 
+    msgrcv(msqid, &rbuf, sizeof(rbuf.mtext), 1, 0); 
+    cout << "[Dept2] received request: " << rbuf.mtext << "\n"; 
+ 
+    my_msgbuf sbuf{2, ""}; 
+    strcpy(sbuf.mtext, "FileDataFromDept2"); 
+    msgsnd(msqid, &sbuf, strlen(sbuf.mtext)+1, 0); 
+ 
+    for (volatile int w = 0; w < 1000; ++w) 
+        for (volatile int k = 0; k < 10000; ++k) { int dummy = w + k; } 
+ 
+    auto t1 = chrono::steady_clock::now(); 
+    threadTimes[idx] = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count(); 
+    return nullptr; 
+} 
+ 
+const int SHM_SIZE = 128; 
+void* dept3(void* a) { 
+    int idx = ((ThreadArg*)a)->idx; 
+    auto t0 = chrono::steady_clock::now(); 
+ 
+    key_t key = ftok("/tmp", 75); 
+    int shmid = shmget(key, SHM_SIZE, 0666 | IPC_CREAT); 
+    char* data = (char*)shmat(shmid, nullptr, 0); 
+    strcpy(data, "SharedMessageFromDept3"); 
+    cout << "[Dept3] wrote to shared memory\n"; 
+    sleep(1); 
+    shmdt(data); 
+    for (volatile int w = 0; w < 1000; ++w) 
+        for (volatile int k = 0; k < 10000; ++k) { int dummy = w + k; } 
+    auto t1 = chrono::steady_clock::now(); 
+    threadTimes[idx] = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count(); 
+    return nullptr; 
+} 
+ 
+void* dept4(void* a) { 
+    int idx = ((ThreadArg*)a)->idx; 
+    auto t0 = chrono::steady_clock::now(); 
+ 
+    sleep(1); 
+    key_t key = ftok("/tmp", 75); 
+    int shmid = shmget(key, SHM_SIZE, 0666); 
+    char* data = (char*)shmat(shmid, nullptr, 0); 
+    cout << "[Dept4] read from shared memory: " << data << "\n"; 
+    shmdt(data); 
+    shmctl(shmid, IPC_RMID, nullptr); 
+ 
+    auto t1 = chrono::steady_clock::now(); 
+    threadTimes[idx] = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count(); 
+    return nullptr; 
+} 
+ 
+void* dept5(void* a) { 
+    int idx = ((ThreadArg*)a)->idx; 
+    auto t0 = chrono::steady_clock::now(); 
+ 
+    cout << "[Dept5] trying to acquire semA and semB (safe order)\n"; 
+ 
+    if (sem_wait(&semA) == 0) { 
+        sleep(1); 
+        if (sem_wait(&semB) == 0) { 
+            cout << "[Dept5] safely acquired both semaphores\n"; 
+            sem_post(&semB); 
+        } else { 
+            cout << "[Dept5] failed to acquire semB\n"; 
+            deadlock_prevented = false; 
+        } 
+        sem_post(&semA); 
+    } else { 
+        cout << "[Dept5] failed to acquire semA\n"; 
+        deadlock_prevented = false; 
+    } 
+ 
+    for (volatile int w = 0; w < 100; ++w) 
+        for (volatile int k = 0; k < 10000; ++k) { int dummy = w + k; } 
+ 
+    auto t1 = chrono::steady_clock::now(); 
+    threadTimes[idx] = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count(); 
+    return nullptr; 
+} 
+ 
+double simulate_fcfs(const vector<long long>& burst) { 
+    int n = burst.size(); 
+    vector<long long> start(n), finish(n); 
+    long long time = 0; 
+    double sum_turn = 0, sum_wait = 0, sum_resp = 0; 
+ 
+    for (int i = 0; i < n; ++i) { 
+        start[i] = time; 
+        time += burst[i]; 
+        finish[i] = time; 
+        sum_turn += finish[i]; 
+        sum_wait += start[i]; 
+        sum_resp += start[i]; 
+    } 
+ 
+    long long makespan = finish[n-1]; 
+    double throughput = (double(n) / makespan) * 1000.0; 
+    double cpu_util = (accumulate(burst.begin(), burst.end(), 0.0) / makespan) * 100.0; 
+ 
+    cout << "\n--- FCFS Metrics ---\n"; 
+    cout << "Completion times: "; for (auto c : finish) cout << c << " "; cout << "\n"; 
+    cout << "Avg Turnaround: " << sum_turn/n 
+         << " | Avg Waiting: " << sum_wait/n 
+         << " | Avg Response: " << sum_resp/n 
+         << " | Throughput: " << fixed << setprecision(2) << throughput << " 
+processes/usec" 
+         << " | CPU Util: " << fixed << setprecision(2) << cpu_util << "%\n"; 
+ 
+    return sum_turn / n; 
+} 
+ 
+double simulate_sjf(const vector<long long>& burst) { 
+    int n = burst.size(); 
+    vector<long long> t = burst; 
+    sort(t.begin(), t.end()); 
+    vector<long long> finish(n); 
+    long long time = 0; 
+    double sum_turn = 0, sum_wait = 0, sum_resp = 0; 
+ 
+    for (int i = 0; i < n; ++i) { 
+        time += t[i]; 
+        finish[i] = time; 
+        sum_turn += finish[i]; 
+        sum_wait += finish[i] - t[i]; 
+        sum_resp += finish[i] - t[i]; 
+    } 
+ 
+    long long makespan = finish[n-1]; 
+    double throughput = (double(n) / makespan) * 1000.0; 
+    double cpu_util = (accumulate(burst.begin(), burst.end(), 0.0) / makespan) * 100.0; 
+ 
+    cout << "\n--- SJF Metrics ---\n"; 
+    cout << "Completion times: "; for (auto c : finish) cout << c << " "; cout << "\n"; 
+    cout << "Avg Turnaround: " << sum_turn/n 
+         << " | Avg Waiting: " << sum_wait/n 
+         << " | Avg Response: " << sum_resp/n 
+         << " | Throughput: " << fixed << setprecision(2) << throughput << " 
+processes/usec" 
+         << " | CPU Util: " << fixed << setprecision(2) << cpu_util << "%\n"; 
+ 
+    return sum_turn / n; 
+} 
+ 
+double simulate_rr(const vector<long long>& burst) { 
+    int n = burst.size(); 
+    vector<long long> rem = burst, finish(n), start(n, -1); 
+    long long time = 0; 
+    int done = 0; 
+    long long quantum = *max_element(burst.begin(), burst.end()) / 2; 
+    if (quantum == 0) quantum = 1; 
+ 
+    for (int i = 0; i < n; ++i) { 
+        if (rem[i] == 0) { 
+            finish[i] = 0; 
+            start[i] = 0; 
+            done++; 
+        } 
+    } 
+ 
+    while (done < n) { 
+        for (int i = 0; i < n; ++i) { 
+            if (rem[i] > 0) { 
+                if (start[i] < 0) start[i] = time; 
+                long long slice = min(quantum, rem[i]); 
+                rem[i] -= slice; 
+                time += slice; 
+                if (rem[i] == 0) { 
+                    finish[i] = time; 
+                    done++; 
+                } 
+            } 
+        } 
+    } 
+ 
+    double sum_turn = 0, sum_wait = 0, sum_resp = 0; 
+    for (int i = 0; i < n; ++i) { 
+        long long turnaround = finish[i]; 
+        sum_turn += turnaround; 
+        sum_wait += turnaround - burst[i]; 
+        sum_resp += start[i];  
+    } 
+ 
+    long long makespan = *max_element(finish.begin(), finish.end()); 
+    double throughput = (double(n) / makespan) * 1000.0; 
+    double cpu_util = (accumulate(burst.begin(), burst.end(), 0.0) / makespan) * 100.0; 
+ 
+    cout << "\n--- RR Metrics ---\n"; 
+    cout << "Completion times: "; for (auto c : finish) cout << c << " "; cout << "\n"; 
+    cout << "Avg Turnaround: " << sum_turn/n 
+         << " | Avg Waiting: " << sum_wait/n 
+         << " | Avg Response: " << sum_resp/n 
+         << " | Throughput: " << fixed << setprecision(2) << throughput << " processes/ 
+usec" 
+         << " | CPU Util: " << fixed << setprecision(2) << cpu_util << "%\n"; 
+ 
+    return sum_turn / n; 
+} 
+ 
+int main() { 
+    pthread_t th[5]; 
+    ThreadArg args[5]; 
+ 
+    sem_init(&semA, 0, 1); 
+    sem_init(&semB, 0, 1); 
+ 
+    auto start_threaded = chrono::steady_clock::now(); 
+ 
+    args[0].idx = 0; pthread_create(&th[0], nullptr, dept1, &args[0]); 
+    args[1].idx = 1; pthread_create(&th[1], nullptr, dept2, &args[1]); 
+    args[2].idx = 2; pthread_create(&th[2], nullptr, dept3, &args[2]); 
+    args[3].idx = 3; pthread_create(&th[3], nullptr, dept4, &args[3]); 
+    args[4].idx = 4; pthread_create(&th[4], nullptr, dept5, &args[4]); 
+ 
+    for (int i = 0; i < 5; ++i) 
+        pthread_join(th[i], nullptr); 
+ 
+    auto end_threaded = chrono::steady_clock::now(); 
+    double time_threaded = 
+chrono::duration_cast<chrono::milliseconds>(end_threaded - start_threaded).count(); 
+ 
+    cout << "\nMeasured thread runtimes (ms):\n"; 
+    for (int i = 0; i < 5; ++i) 
+        cout << " Dept" << (i+1) << ": " << threadTimes[i] << "\n"; 
+ 
+    double time_sequential = accumulate(threadTimes.begin(), threadTimes.end(), 0.0); 
+    cout << "Threading overhead: " << fixed << setprecision(2) 
+         << ((time_threaded - time_sequential) / time_sequential) * 100 << "%\n"; 
+ 
+if (deadlock_prevented) 
+cout << "\u2705 Deadlock scenario prevented using semaphore order\n"; 
+else 
+cout << "\u274C Deadlock occurred due to improper semaphore usage\n"; 
+cout << "Explanation: Deadlock can occur if two threads acquire resources in 
+opposite order.\n"; 
+vector<double> avg = { 
+simulate_sjf(threadTimes), 
+simulate_rr(threadTimes), 
+simulate_fcfs(threadTimes) 
+}; 
+vector<string> names = {"SJF", "RR", "FCFS"}; 
+int bestIdx = min_element(avg.begin(), avg.end()) - avg.begin(); 
+int worstIdx = max_element(avg.begin(), avg.end()) - avg.begin(); 
+cout << "\nBest scheduler: " << names[bestIdx] << " (" << avg[bestIdx] << " 
+ms)\n"; 
+cout << "Worst scheduler: " << names[worstIdx] << " (" << avg[worstIdx] << " 
+ms)\n"; 
+sem_destroy(&semA); 
+sem_destroy(&semB); 
+return 0; 
+} 
